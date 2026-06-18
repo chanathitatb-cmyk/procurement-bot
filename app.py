@@ -1,228 +1,209 @@
-import os
-import re
-from datetime import datetime
+import os, re
+from datetime import datetime, date
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
 from apscheduler.schedulers.background import BackgroundScheduler
-from sheets import (
-    add_task, get_all_tasks, update_status, get_task_by_id,
-    get_pending_tasks, get_monthly_summary
-)
+from sheets import add_task, get_tasks, set_status, delete_task
 import pytz
 
-app = Flask(__name__)
+app    = Flask(__name__)
+TH_TZ  = pytz.timezone("Asia/Bangkok")
+api    = LineBotApi(os.environ["LINE_CHANNEL_ACCESS_TOKEN"])
+handle = WebhookHandler(os.environ["LINE_CHANNEL_SECRET"])
+MY_ID  = os.environ.get("LINE_USER_ID", "")
 
-LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "YOUR_TOKEN")
-LINE_CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET", "YOUR_SECRET")
-MY_USER_ID                = os.environ.get("LINE_USER_ID", "")   # ไว้ส่ง morning report
+STATUS = {"1":"รอทำ", "2":"กำลังทำ", "3":"รอคนอื่น", "4":"เสร็จ"}
+EMOJI  = {"รอทำ":"⏳", "กำลังทำ":"🔄", "รอคนอื่น":"🕐", "เสร็จ":"✅"}
 
-line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
-handler      = WebhookHandler(LINE_CHANNEL_SECRET)
-TH_TZ        = pytz.timezone("Asia/Bangkok")
+# ── helpers ────────────────────────────────────────────────────
 
-STATUSES = {
-    "สืบราคา":      "สืบราคา",
-    "รอผอ":         "รอ ผอ. เซ็น",
-    "รอmd":         "รอ MD เซ็น",
-    "draftใหม่":    "ต้องการ Draft ใหม่",
-    "supplier":     "อยู่ที่ Supplier",
-    "ผลิต":         "กำลังผลิต",
-    "เสร็จ":        "เสร็จสิ้น",
-    "draft":        "จัดทำ Draft",
-    "ส่งdraft":     "ส่ง Draft แล้ว",
-}
+def fmt_task(t):
+    e    = EMOJI.get(t["status"], "•")
+    dead = ""
+    if t.get("deadline"):
+        try:
+            d    = datetime.strptime(t["deadline"], "%Y-%m-%d").date()
+            diff = (d - date.today()).days
+            warn = " ⚠️" if 0 <= diff <= 2 else (" 🔴" if diff < 0 else "")
+            dead = f"\n   📅 {t['deadline']}{warn}"
+        except: pass
+    who = f" (จาก {t['from_who']})" if t.get("from_who") else ""
+    return f"{e} [{t['id']}] {t['name']}{who}{dead}"
 
-STATUS_EMOJI = {
-    "สืบราคา":           "🔍",
-    "รอ ผอ. เซ็น":       "✍️",
-    "รอ MD เซ็น":        "📋",
-    "ต้องการ Draft ใหม่": "🔄",
-    "อยู่ที่ Supplier":  "🏭",
-    "กำลังผลิต":         "⚙️",
-    "เสร็จสิ้น":         "✅",
-    "จัดทำ Draft":       "📝",
-    "ส่ง Draft แล้ว":    "📤",
-}
+def tasks_text(tasks, title):
+    if not tasks: return f"{title}\n—— ไม่มีงาน ——"
+    lines = [title]
+    for t in tasks: lines.append(fmt_task(t))
+    return "\n".join(lines)
 
-HELP_TEXT = """🤖 บอทติดตามงานจัดซื้อ
-
-➕ เพิ่มงานใหม่:
-  เพิ่ม [ชื่องาน] | [ได้จากใคร] | [มูลค่า]
-  ตย: เพิ่ม ซื้อโต๊ะ 10 ตัว | ฝ่ายบุคคล | 50000
-
-📋 ดูรายการ:  งาน
-📊 รีพอร์ต:   รีพอร์ต
-
-🔄 อัปเดตสถานะ:
-  สถานะ [เลข] [สถานะ]
-  ตย: สถานะ 3 รอผอ
-
-สถานะที่ใช้ได้:
-  draft / ส่งdraft / สืบราคา / รอผอ
-  รอmd / draftใหม่ / supplier / ผลิต / เสร็จ
-
-💰 เพิ่มมูลค่าทีหลัง:
-  มูลค่า [เลข] [จำนวน]
-  ตย: มูลค่า 3 75000
-
-🗑️ ลบ: ลบ [เลข]"""
-
-
-def format_task_line(t):
-    emoji = STATUS_EMOJI.get(t.get("status", ""), "📌")
-    budget = f"  💰 {int(float(t['budget'])):,} บ." if t.get("budget") else ""
-    return (
-        f"{t['id']}. {emoji} {t['name']}\n"
-        f"   จาก: {t.get('from_who','—')}  |  รับ: {t.get('date','—')}\n"
-        f"   สถานะ: {t.get('status','—')}{budget}"
-    )
-
+# ── morning report ─────────────────────────────────────────────
 
 def morning_report():
-    pending = get_pending_tasks()
-    now_str = datetime.now(TH_TZ).strftime("%d/%m/%Y")
-    if not pending:
-        msg = f"🌅 {now_str}\n✅ ไม่มีงานค้างอยู่ เยี่ยมมาก!"
-    else:
-        lines = [f"🌅 รีพอร์ตงานประจำวัน {now_str}", "─" * 28]
-        by_status = {}
-        for t in pending:
-            s = t.get("status", "อื่นๆ")
-            by_status.setdefault(s, []).append(t)
-        for status, tasks in by_status.items():
-            emoji = STATUS_EMOJI.get(status, "📌")
-            lines.append(f"\n{emoji} {status} ({len(tasks)} งาน)")
-            for t in tasks:
-                budget = f" | {int(float(t['budget'])):,} บ." if t.get("budget") else ""
-                lines.append(f"  • [{t['id']}] {t['name']}{budget}")
-        lines.append(f"\n📊 รวม {len(pending)} งานที่ยังไม่เสร็จ")
-        msg = "\n".join(lines)
-    if MY_USER_ID:
-        line_bot_api.push_message(MY_USER_ID, TextSendMessage(text=msg))
+    all_tasks = get_tasks()
+    pending   = [t for t in all_tasks if t["status"] != "เสร็จ"]
+    today     = datetime.now(TH_TZ).strftime("%d/%m/%Y")
 
+    if not pending:
+        msg = f"🌅 {today}\n\nไม่มีงานค้าง 🎉\nหยุดพักได้บ้างนะ"
+    else:
+        overdue  = [t for t in pending if _is_overdue(t)]
+        today_dl = [t for t in pending if _is_today(t)]
+        rest     = [t for t in pending if not _is_overdue(t) and not _is_today(t)]
+
+        lines = [f"🌅 สวัสดีตอนเช้า! {today}",
+                 f"📋 เหลืองาน {len(pending)} รายการ", ""]
+
+        if overdue:
+            lines.append(f"🔴 เลยกำหนดแล้ว ({len(overdue)})")
+            for t in overdue: lines.append(f"  {fmt_task(t)}")
+            lines.append("")
+        if today_dl:
+            lines.append(f"⚠️ ครบกำหนดวันนี้ ({len(today_dl)})")
+            for t in today_dl: lines.append(f"  {fmt_task(t)}")
+            lines.append("")
+        if rest:
+            lines.append(f"📌 งานที่เหลือ ({len(rest)})")
+            for t in rest: lines.append(f"  {fmt_task(t)}")
+        msg = "\n".join(lines)
+
+    if MY_ID: api.push_message(MY_ID, TextSendMessage(text=msg))
+
+def _is_overdue(t):
+    try: return datetime.strptime(t["deadline"], "%Y-%m-%d").date() < date.today()
+    except: return False
+
+def _is_today(t):
+    try: return datetime.strptime(t["deadline"], "%Y-%m-%d").date() == date.today()
+    except: return False
+
+# ── LINE handler ───────────────────────────────────────────────
 
 @app.route("/callback", methods=["POST"])
 def callback():
-    signature = request.headers["X-Line-Signature"]
+    sig  = request.headers["X-Line-Signature"]
     body = request.get_data(as_text=True)
-    try:
-        handler.handle(body, signature)
-    except InvalidSignatureError:
-        abort(400)
+    try: handle.handle(body, sig)
+    except InvalidSignatureError: abort(400)
     return "OK"
 
-
-@handler.add(MessageEvent, message=TextMessage)
-def handle_message(event):
+@handle.add(MessageEvent, message=TextMessage)
+def on_message(event):
     text = event.message.text.strip()
     tl   = text.lower().replace(" ", "")
+    reply = route(text, tl)
+    api.reply_message(event.reply_token, TextSendMessage(text=reply))
 
-    # ── เพิ่มงาน ──────────────────────────────────────────────────
-    if text.startswith("เพิ่ม "):
-        parts = text[6:].split("|")
-        name     = parts[0].strip()
-        from_who = parts[1].strip() if len(parts) > 1 else ""
-        budget   = parts[2].strip() if len(parts) > 2 else ""
+def route(text, tl):
+    # ── เพิ่มงาน ─────────────────────────────────────────
+    # รูปแบบ: ชื่องาน | ใครให้มา | DD/MM หรือ DD/MM/YY
+    if text.startswith("+ ") or text.startswith("เพิ่ม "):
+        raw   = text.split(" ", 1)[1].strip()
+        parts = [p.strip() for p in raw.split("|")]
+        name     = parts[0]
+        from_who = parts[1] if len(parts) > 1 else ""
+        deadline = ""
+        if len(parts) > 2:
+            deadline = parse_date(parts[2])
         if not name:
-            reply = "⚠️ ระบุชื่องานด้วยครับ\nตย: เพิ่ม ซื้อโต๊ะ | ฝ่ายบุคคล | 50000"
-        else:
-            row_id = add_task(name, from_who, budget)
-            budget_txt = f"\n💰 มูลค่า: {int(float(budget)):,} บ." if budget else ""
-            reply = (
-                f"✅ เพิ่มงาน #{row_id} แล้ว\n"
-                f"📋 {name}\n"
-                f"👤 จาก: {from_who or '—'}{budget_txt}\n"
-                f"สถานะ: จัดทำ Draft"
-            )
+            return '⚠️ ระบุชื่องานด้วย\nตย: + ทำรายงาน | หัวหน้า | 25/6'
+        tid = add_task(name, from_who, deadline)
+        dl_txt = f"\n📅 deadline: {deadline}" if deadline else ""
+        who_txt = f"\n👤 จาก: {from_who}" if from_who else ""
+        return f"✅ บันทึกงาน #{tid}\n📝 {name}{who_txt}{dl_txt}\nสถานะ: ⏳ รอทำ"
 
-    # ── ดูรายการ ──────────────────────────────────────────────────
-    elif tl in ["งาน", "รายการ", "list"]:
-        tasks = get_all_tasks()
-        if not tasks:
-            reply = "📭 ยังไม่มีงานในระบบ"
-        else:
-            pending = [t for t in tasks if t.get("status") != "เสร็จสิ้น"]
-            done    = [t for t in tasks if t.get("status") == "เสร็จสิ้น"]
-            lines   = [f"📋 งานทั้งหมด ({len(tasks)} งาน)", "─" * 28]
-            if pending:
-                lines.append(f"\n🔄 ยังดำเนินการ ({len(pending)} งาน)")
-                for t in pending:
-                    lines.append(format_task_line(t))
-            if done:
-                lines.append(f"\n✅ เสร็จแล้ว ({len(done)} งาน)")
-                for t in done:
-                    lines.append(format_task_line(t))
-            reply = "\n".join(lines)
+    # ── ดูงาน ─────────────────────────────────────────────
+    elif tl in ["งาน", "ดูงาน", "list", "หน้าที่"]:
+        all_tasks = get_tasks()
+        pending   = [t for t in all_tasks if t["status"] != "เสร็จ"]
+        if not pending:
+            return "✅ ไม่มีงานค้างเลย เยี่ยม!"
+        by = {"รอทำ":[], "กำลังทำ":[], "รอคนอื่น":[]}
+        for t in pending: by[t["status"]].append(t)
+        lines = [f"📋 งานค้าง {len(pending)} รายการ"]
+        for status, icon in [("กำลังทำ","🔄"),("รอทำ","⏳"),("รอคนอื่น","🕐")]:
+            if by[status]:
+                lines.append(f"\n{icon} {status}")
+                for t in by[status]: lines.append(f"  {fmt_task(t)}")
+        lines.append('\n💡 พิมพ์ "เสร็จ [เลข]" เมื่อทำเสร็จ')
+        return "\n".join(lines)
 
-    # ── อัปเดตสถานะ ────────────────────────────────────────────────
-    elif text.lower().startswith("สถานะ "):
-        parts = text[6:].strip().split(None, 1)
-        if len(parts) < 2 or not parts[0].isdigit():
-            reply = "⚠️ รูปแบบ: สถานะ [เลข] [สถานะ]\nตย: สถานะ 3 รอผอ"
-        else:
-            task_id    = int(parts[0])
-            status_key = parts[1].strip().lower().replace(" ", "")
-            new_status = STATUSES.get(status_key)
-            if not new_status:
-                opts = "  " + "\n  ".join(STATUSES.keys())
-                reply = f"⚠️ ไม่รู้จักสถานะ '{parts[1]}'\nใช้: \n{opts}"
-            else:
-                ok = update_status(task_id, new_status)
-                if ok:
-                    emoji = STATUS_EMOJI.get(new_status, "📌")
-                    reply = f"{emoji} งาน #{task_id} → {new_status}"
-                else:
-                    reply = f"⚠️ ไม่พบงาน #{task_id}"
+    # ── อัปเดตสถานะ shortcut ──────────────────────────────
+    elif re.match(r"^(ทำ|เริ่ม) \d+$", text):
+        return _set(int(text.split()[1]), "กำลังทำ")
 
-    # ── อัปเดตมูลค่า ────────────────────────────────────────────────
-    elif text.lower().startswith("มูลค่า "):
-        parts = text[7:].strip().split(None, 1)
-        if len(parts) < 2 or not parts[0].isdigit():
-            reply = "⚠️ รูปแบบ: มูลค่า [เลข] [จำนวน]\nตย: มูลค่า 3 75000"
-        else:
-            task_id = int(parts[0])
-            budget  = parts[1].strip().replace(",", "")
-            ok = update_status(task_id, budget_only=float(budget))
-            reply = f"💰 อัปเดตมูลค่างาน #{task_id} → {int(float(budget)):,} บ." if ok else f"⚠️ ไม่พบงาน #{task_id}"
+    elif re.match(r"^รอ \d+$", text):
+        return _set(int(text.split()[1]), "รอคนอื่น")
 
-    # ── ลบงาน ─────────────────────────────────────────────────────
+    elif re.match(r"^เสร็จ \d+$", text):
+        return _set(int(text.split()[1]), "เสร็จ")
+
+    elif re.match(r"^ยัง \d+$", text):
+        return _set(int(text.split()[1]), "รอทำ")
+
+    # ── ลบ ────────────────────────────────────────────────
     elif re.match(r"^ลบ \d+$", text):
-        task_id = int(text.split()[1])
-        ok = update_status(task_id, delete=True)
-        reply = f"🗑️ ลบงาน #{task_id} แล้ว" if ok else f"⚠️ ไม่พบงาน #{task_id}"
+        ok = delete_task(int(text.split()[1]))
+        return f"🗑️ ลบงาน #{text.split()[1]} แล้ว" if ok else "⚠️ ไม่พบงานนั้น"
 
-    # ── รีพอร์ต ────────────────────────────────────────────────────
-    elif tl in ["รีพอร์ต", "report", "สรุป"]:
-        summary = get_monthly_summary()
-        now_str = datetime.now(TH_TZ).strftime("%B %Y")
-        lines = [f"📊 สรุปงานเดือน {now_str}", "─" * 28]
-        lines.append(f"📁 งานทั้งหมด:    {summary['total']} งาน")
-        lines.append(f"✅ เสร็จสิ้น:      {summary['done']} งาน")
-        lines.append(f"🔄 กำลังดำเนินการ: {summary['pending']} งาน")
-        if summary.get("total_budget"):
-            lines.append(f"💰 มูลค่ารวม:     {int(summary['total_budget']):,} บ.")
-        if summary.get("by_status"):
-            lines.append("\nแยกตามสถานะ:")
-            for s, count in summary["by_status"].items():
-                e = STATUS_EMOJI.get(s, "📌")
-                lines.append(f"  {e} {s}: {count} งาน")
-        reply = "\n".join(lines)
+    # ── สรุป ──────────────────────────────────────────────
+    elif tl in ["สรุป", "รีพอร์ต", "report"]:
+        all_tasks = get_tasks()
+        pending   = [t for t in all_tasks if t["status"] != "เสร็จ"]
+        done      = [t for t in all_tasks if t["status"] == "เสร็จ"]
+        overdue   = [t for t in pending if _is_overdue(t)]
+        lines = [
+            f"📊 สรุปงาน",
+            f"⏳ รอทำ:      {sum(1 for t in pending if t['status']=='รอทำ')}",
+            f"🔄 กำลังทำ:   {sum(1 for t in pending if t['status']=='กำลังทำ')}",
+            f"🕐 รอคนอื่น:  {sum(1 for t in pending if t['status']=='รอคนอื่น')}",
+            f"✅ เสร็จแล้ว: {len(done)}",
+        ]
+        if overdue: lines.append(f"🔴 เลยกำหนด:  {len(overdue)}")
+        return "\n".join(lines)
 
-    # ── ช่วยเหลือ ─────────────────────────────────────────────────
+    # ── ช่วย ──────────────────────────────────────────────
     elif tl in ["ช่วย", "help", "?"]:
-        reply = HELP_TEXT
+        return """📖 วิธีใช้บอทบันทึกงาน
+
+➕ เพิ่มงาน:
++ [ชื่องาน] | [จากใคร] | [วันส่ง]
+ตย: + ทำรายงาน | หัวหน้า | 25/6
+
+📋 ดูงาน:  งาน
+📊 สรุป:   สรุป
+
+🔄 อัปเดต:
+ทำ [เลข]   → กำลังทำ
+รอ [เลข]   → รอคนอื่น
+เสร็จ [เลข] → เสร็จแล้ว
+ยัง [เลข]  → กลับไปรอทำ
+ลบ [เลข]   → ลบออก"""
 
     else:
-        reply = 'ไม่เข้าใจคำสั่ง 🤔\nพิมพ์ "ช่วย" เพื่อดูคำสั่งทั้งหมด'
+        return 'ไม่เข้าใจครับ\nพิมพ์ "ช่วย" เพื่อดูวิธีใช้'
 
-    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+def _set(tid, status):
+    ok = set_status(tid, status)
+    return f"{EMOJI[status]} งาน #{tid} → {status}" if ok else f"⚠️ ไม่พบงาน #{tid}"
 
+def parse_date(raw):
+    """แปลง 25/6, 25/6/25, 25/06/2025 → YYYY-MM-DD"""
+    raw = raw.strip()
+    for fmt in ["%d/%m/%Y", "%d/%m/%y", "%d/%m"]:
+        try:
+            d = datetime.strptime(raw, fmt)
+            if fmt == "%d/%m":
+                d = d.replace(year=date.today().year)
+                if d.date() < date.today(): d = d.replace(year=d.year + 1)
+            return d.strftime("%Y-%m-%d")
+        except: pass
+    return ""
 
 if __name__ == "__main__":
-    scheduler = BackgroundScheduler(timezone=TH_TZ)
-    scheduler.add_job(morning_report, "cron", hour=8, minute=0)
-    scheduler.start()
-    print("🤖 Procurement Bot เริ่มทำงาน...")
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    sched = BackgroundScheduler(timezone=TH_TZ)
+    sched.add_job(morning_report, "cron", hour=8, minute=0)
+    sched.start()
+    print("🤖 Task Bot พร้อมแล้ว")
+    app.run(host="0.0.0.0", port=5000)
