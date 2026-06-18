@@ -1,84 +1,160 @@
-import os, re
+import os, json
 from datetime import datetime, date
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
 from apscheduler.schedulers.background import BackgroundScheduler
-from sheets import add_task, get_tasks, set_status, delete_task
+import anthropic
+from sheets import get_tasks, add_task, set_status, delete_task
 import pytz
 
 app    = Flask(__name__)
 TH_TZ  = pytz.timezone("Asia/Bangkok")
-api    = LineBotApi(os.environ["LINE_CHANNEL_ACCESS_TOKEN"])
+line   = LineBotApi(os.environ["LINE_CHANNEL_ACCESS_TOKEN"])
 handle = WebhookHandler(os.environ["LINE_CHANNEL_SECRET"])
 MY_ID  = os.environ.get("LINE_USER_ID", "")
+ai     = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
-STATUS = {"1":"รอทำ", "2":"กำลังทำ", "3":"รอคนอื่น", "4":"เสร็จ"}
-EMOJI  = {"รอทำ":"⏳", "กำลังทำ":"🔄", "รอคนอื่น":"🕐", "เสร็จ":"✅"}
+# เก็บ conversation history ต่อ user (in-memory, สั้นๆ)
+_history = {}
 
-# ── helpers ────────────────────────────────────────────────────
+# ── System prompt ──────────────────────────────────────────────
 
-def fmt_task(t):
-    e    = EMOJI.get(t["status"], "•")
-    dead = ""
-    if t.get("deadline"):
-        try:
-            d    = datetime.strptime(t["deadline"], "%Y-%m-%d").date()
-            diff = (d - date.today()).days
-            warn = " ⚠️" if 0 <= diff <= 2 else (" 🔴" if diff < 0 else "")
-            dead = f"\n   📅 {t['deadline']}{warn}"
-        except: pass
-    who = f" (จาก {t['from_who']})" if t.get("from_who") else ""
-    return f"{e} [{t['id']}] {t['name']}{who}{dead}"
+def build_system(tasks):
+    today    = datetime.now(TH_TZ).strftime("%d/%m/%Y")
+    pending  = [t for t in tasks if t["status"] != "เสร็จ"]
+    done_cnt = sum(1 for t in tasks if t["status"] == "เสร็จ")
 
-def tasks_text(tasks, title):
-    if not tasks: return f"{title}\n—— ไม่มีงาน ——"
-    lines = [title]
-    for t in tasks: lines.append(fmt_task(t))
-    return "\n".join(lines)
+    tasks_json = json.dumps(pending, ensure_ascii=False, indent=2)
 
-# ── morning report ─────────────────────────────────────────────
+    return f"""คุณคือผู้ช่วยบันทึกงานส่วนตัวใน LINE วันนี้คือ {today}
+
+งานที่มีอยู่ตอนนี้ ({len(pending)} งานค้าง, เสร็จแล้ว {done_cnt} งาน):
+{tasks_json}
+
+สถานะที่มี: รอทำ / กำลังทำ / รอคนอื่น / เสร็จ
+
+ความสามารถของคุณ:
+1. บันทึกงานใหม่เมื่อผู้ใช้บอกว่าได้รับงาน
+2. อัปเดตสถานะงานเมื่อมีความคืบหน้า
+3. แนะนำว่าควรทำอะไรก่อน (ดู deadline และความสำคัญ)
+4. วิเคราะห์ workload และแจ้งเตือนถ้างานเยอะหรือใกล้ deadline
+5. ลบงานที่ไม่ต้องการ
+6. ตอบคำถามทั่วไปเกี่ยวกับงาน
+
+กฎสำคัญ:
+- ตอบสั้น กระชับ ภาษาไทยเป็นกันเอง
+- ถ้าผู้ใช้บอกงานใหม่แบบไม่ครบ ให้ถามกลับเฉพาะที่จำเป็น (deadline สำคัญที่สุด)
+- ถ้าจะทำ action (เพิ่ม/แก้/ลบ) ให้บอก action ที่จะทำในรูปแบบ JSON ท้ายข้อความ
+- ห้ามแต่งข้อมูลงานที่ไม่มีอยู่จริง
+- ถ้าไม่แน่ใจว่าผู้ใช้หมายถึงงานไหน ให้ถามก่อน
+
+รูปแบบ JSON action (ใส่ท้ายสุดของ response เสมอถ้ามี action):
+{"action": "add", "name": "...", "from_who": "...", "deadline": "YYYY-MM-DD"}
+{"action": "set_status", "id": 1, "status": "กำลังทำ"}
+{"action": "delete", "id": 1}
+{"action": "none"}
+"""
+
+# ── AI call ────────────────────────────────────────────────────
+
+def ask_ai(user_id, user_msg):
+    tasks = get_tasks()
+
+    if user_id not in _history:
+        _history[user_id] = []
+
+    _history[user_id].append({"role": "user", "content": user_msg})
+
+    # เก็บแค่ 10 ข้อความล่าสุด
+    history = _history[user_id][-10:]
+
+    resp = ai.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=1000,
+        system=build_system(tasks),
+        messages=history
+    )
+
+    ai_text = resp.content[0].text
+    _history[user_id].append({"role": "assistant", "content": ai_text})
+
+    # แยก action JSON กับข้อความปกติ
+    reply, action = parse_response(ai_text)
+
+    # ทำ action
+    result_msg = execute_action(action) if action else ""
+
+    return reply + (f"\n\n{result_msg}" if result_msg else "")
+
+
+def parse_response(text):
+    """แยก JSON action ออกจากข้อความ"""
+    import re
+    pattern = r'\{[^{}]*"action"[^{}]*\}'
+    match   = re.search(pattern, text)
+    if not match:
+        return text.strip(), None
+    try:
+        action    = json.loads(match.group())
+        clean_txt = text[:match.start()].strip()
+        return clean_txt, action
+    except:
+        return text.strip(), None
+
+
+def execute_action(action):
+    a = action.get("action")
+    if a == "add":
+        tid = add_task(
+            action.get("name", ""),
+            action.get("from_who", ""),
+            action.get("deadline", "")
+        )
+        dl = f" (ส่ง {action['deadline']})" if action.get("deadline") else ""
+        return f"✅ บันทึกงาน #{tid}{dl} แล้วครับ"
+
+    elif a == "set_status":
+        ok     = set_status(action["id"], action["status"])
+        emoji  = {"รอทำ":"⏳","กำลังทำ":"🔄","รอคนอื่น":"🕐","เสร็จ":"✅"}.get(action["status"],"")
+        return f"{emoji} งาน #{action['id']} → {action['status']}" if ok else ""
+
+    elif a == "delete":
+        ok = delete_task(action["id"])
+        return f"🗑️ ลบงาน #{action['id']} แล้ว" if ok else ""
+
+    return ""
+
+# ── Morning report (ยังใช้ AI) ────────────────────────────────
 
 def morning_report():
-    all_tasks = get_tasks()
-    pending   = [t for t in all_tasks if t["status"] != "เสร็จ"]
-    today     = datetime.now(TH_TZ).strftime("%d/%m/%Y")
-
+    tasks   = get_tasks()
+    pending = [t for t in tasks if t["status"] != "เสร็จ"]
     if not pending:
-        msg = f"🌅 {today}\n\nไม่มีงานค้าง 🎉\nหยุดพักได้บ้างนะ"
+        msg = "🌅 สวัสดีตอนเช้า!\n\nไม่มีงานค้างเลย 🎉"
     else:
-        overdue  = [t for t in pending if _is_overdue(t)]
-        today_dl = [t for t in pending if _is_today(t)]
-        rest     = [t for t in pending if not _is_overdue(t) and not _is_today(t)]
+        today = datetime.now(TH_TZ).strftime("%d/%m/%Y")
+        tasks_str = "\n".join(
+            f"- [{t['id']}] {t['name']} | {t['status']}"
+            + (f" | deadline {t['deadline']}" if t.get("deadline") else "")
+            for t in pending
+        )
+        prompt = f"""วันนี้ {today} มีงานค้าง {len(pending)} รายการ:
+{tasks_str}
 
-        lines = [f"🌅 สวัสดีตอนเช้า! {today}",
-                 f"📋 เหลืองาน {len(pending)} รายการ", ""]
+สรุปรายงานเช้าแบบกระชับ บอกว่าวันนี้ควรโฟกัสงานอะไรก่อน เน้น deadline ที่ใกล้หรือเลยแล้ว ใช้ emoji ให้ดูง่าย ตอบเป็นภาษาไทย ไม่เกิน 15 บรรทัด"""
+        resp = ai.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=600,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        msg = "🌅 รายงานงานประจำวัน\n\n" + resp.content[0].text
 
-        if overdue:
-            lines.append(f"🔴 เลยกำหนดแล้ว ({len(overdue)})")
-            for t in overdue: lines.append(f"  {fmt_task(t)}")
-            lines.append("")
-        if today_dl:
-            lines.append(f"⚠️ ครบกำหนดวันนี้ ({len(today_dl)})")
-            for t in today_dl: lines.append(f"  {fmt_task(t)}")
-            lines.append("")
-        if rest:
-            lines.append(f"📌 งานที่เหลือ ({len(rest)})")
-            for t in rest: lines.append(f"  {fmt_task(t)}")
-        msg = "\n".join(lines)
+    if MY_ID:
+        line.push_message(MY_ID, TextSendMessage(text=msg))
 
-    if MY_ID: api.push_message(MY_ID, TextSendMessage(text=msg))
-
-def _is_overdue(t):
-    try: return datetime.strptime(t["deadline"], "%Y-%m-%d").date() < date.today()
-    except: return False
-
-def _is_today(t):
-    try: return datetime.strptime(t["deadline"], "%Y-%m-%d").date() == date.today()
-    except: return False
-
-# ── LINE handler ───────────────────────────────────────────────
+# ── LINE webhook ───────────────────────────────────────────────
 
 @app.route("/callback", methods=["POST"])
 def callback():
@@ -90,120 +166,18 @@ def callback():
 
 @handle.add(MessageEvent, message=TextMessage)
 def on_message(event):
-    text = event.message.text.strip()
-    tl   = text.lower().replace(" ", "")
-    reply = route(text, tl)
-    api.reply_message(event.reply_token, TextSendMessage(text=reply))
+    user_id = event.source.user_id
+    text    = event.message.text.strip()
+    try:
+        reply = ask_ai(user_id, text)
+    except Exception as e:
+        reply = f"เกิดข้อผิดพลาด: {str(e)}"
+    line.reply_message(event.reply_token, TextSendMessage(text=reply))
 
-def route(text, tl):
-    # ── เพิ่มงาน ─────────────────────────────────────────
-    # รูปแบบ: ชื่องาน | ใครให้มา | DD/MM หรือ DD/MM/YY
-    if text.startswith("+ ") or text.startswith("เพิ่ม "):
-        raw   = text.split(" ", 1)[1].strip()
-        parts = [p.strip() for p in raw.split("|")]
-        name     = parts[0]
-        from_who = parts[1] if len(parts) > 1 else ""
-        deadline = ""
-        if len(parts) > 2:
-            deadline = parse_date(parts[2])
-        if not name:
-            return '⚠️ ระบุชื่องานด้วย\nตย: + ทำรายงาน | หัวหน้า | 25/6'
-        tid = add_task(name, from_who, deadline)
-        dl_txt = f"\n📅 deadline: {deadline}" if deadline else ""
-        who_txt = f"\n👤 จาก: {from_who}" if from_who else ""
-        return f"✅ บันทึกงาน #{tid}\n📝 {name}{who_txt}{dl_txt}\nสถานะ: ⏳ รอทำ"
-
-    # ── ดูงาน ─────────────────────────────────────────────
-    elif tl in ["งาน", "ดูงาน", "list", "หน้าที่"]:
-        all_tasks = get_tasks()
-        pending   = [t for t in all_tasks if t["status"] != "เสร็จ"]
-        if not pending:
-            return "✅ ไม่มีงานค้างเลย เยี่ยม!"
-        by = {"รอทำ":[], "กำลังทำ":[], "รอคนอื่น":[]}
-        for t in pending: by[t["status"]].append(t)
-        lines = [f"📋 งานค้าง {len(pending)} รายการ"]
-        for status, icon in [("กำลังทำ","🔄"),("รอทำ","⏳"),("รอคนอื่น","🕐")]:
-            if by[status]:
-                lines.append(f"\n{icon} {status}")
-                for t in by[status]: lines.append(f"  {fmt_task(t)}")
-        lines.append('\n💡 พิมพ์ "เสร็จ [เลข]" เมื่อทำเสร็จ')
-        return "\n".join(lines)
-
-    # ── อัปเดตสถานะ shortcut ──────────────────────────────
-    elif re.match(r"^(ทำ|เริ่ม) \d+$", text):
-        return _set(int(text.split()[1]), "กำลังทำ")
-
-    elif re.match(r"^รอ \d+$", text):
-        return _set(int(text.split()[1]), "รอคนอื่น")
-
-    elif re.match(r"^เสร็จ \d+$", text):
-        return _set(int(text.split()[1]), "เสร็จ")
-
-    elif re.match(r"^ยัง \d+$", text):
-        return _set(int(text.split()[1]), "รอทำ")
-
-    # ── ลบ ────────────────────────────────────────────────
-    elif re.match(r"^ลบ \d+$", text):
-        ok = delete_task(int(text.split()[1]))
-        return f"🗑️ ลบงาน #{text.split()[1]} แล้ว" if ok else "⚠️ ไม่พบงานนั้น"
-
-    # ── สรุป ──────────────────────────────────────────────
-    elif tl in ["สรุป", "รีพอร์ต", "report"]:
-        all_tasks = get_tasks()
-        pending   = [t for t in all_tasks if t["status"] != "เสร็จ"]
-        done      = [t for t in all_tasks if t["status"] == "เสร็จ"]
-        overdue   = [t for t in pending if _is_overdue(t)]
-        lines = [
-            f"📊 สรุปงาน",
-            f"⏳ รอทำ:      {sum(1 for t in pending if t['status']=='รอทำ')}",
-            f"🔄 กำลังทำ:   {sum(1 for t in pending if t['status']=='กำลังทำ')}",
-            f"🕐 รอคนอื่น:  {sum(1 for t in pending if t['status']=='รอคนอื่น')}",
-            f"✅ เสร็จแล้ว: {len(done)}",
-        ]
-        if overdue: lines.append(f"🔴 เลยกำหนด:  {len(overdue)}")
-        return "\n".join(lines)
-
-    # ── ช่วย ──────────────────────────────────────────────
-    elif tl in ["ช่วย", "help", "?"]:
-        return """📖 วิธีใช้บอทบันทึกงาน
-
-➕ เพิ่มงาน:
-+ [ชื่องาน] | [จากใคร] | [วันส่ง]
-ตย: + ทำรายงาน | หัวหน้า | 25/6
-
-📋 ดูงาน:  งาน
-📊 สรุป:   สรุป
-
-🔄 อัปเดต:
-ทำ [เลข]   → กำลังทำ
-รอ [เลข]   → รอคนอื่น
-เสร็จ [เลข] → เสร็จแล้ว
-ยัง [เลข]  → กลับไปรอทำ
-ลบ [เลข]   → ลบออก"""
-
-    else:
-        return 'ไม่เข้าใจครับ\nพิมพ์ "ช่วย" เพื่อดูวิธีใช้'
-
-def _set(tid, status):
-    ok = set_status(tid, status)
-    return f"{EMOJI[status]} งาน #{tid} → {status}" if ok else f"⚠️ ไม่พบงาน #{tid}"
-
-def parse_date(raw):
-    """แปลง 25/6, 25/6/25, 25/06/2025 → YYYY-MM-DD"""
-    raw = raw.strip()
-    for fmt in ["%d/%m/%Y", "%d/%m/%y", "%d/%m"]:
-        try:
-            d = datetime.strptime(raw, fmt)
-            if fmt == "%d/%m":
-                d = d.replace(year=date.today().year)
-                if d.date() < date.today(): d = d.replace(year=d.year + 1)
-            return d.strftime("%Y-%m-%d")
-        except: pass
-    return ""
 
 if __name__ == "__main__":
     sched = BackgroundScheduler(timezone=TH_TZ)
     sched.add_job(morning_report, "cron", hour=8, minute=0)
     sched.start()
-    print("🤖 Task Bot พร้อมแล้ว")
+    print("🤖 AI Task Bot พร้อมแล้ว")
     app.run(host="0.0.0.0", port=5000)
