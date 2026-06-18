@@ -5,14 +5,6 @@ from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
 from apscheduler.schedulers.background import BackgroundScheduler
-import os, json, re
-import requests as req
-from datetime import datetime, date
-from flask import Flask, request, abort
-from linebot import LineBotApi, WebhookHandler
-from linebot.exceptions import InvalidSignatureError
-from linebot.models import MessageEvent, TextMessage, TextSendMessage
-from apscheduler.schedulers.background import BackgroundScheduler
 from sheets import get_tasks, add_task, set_status, delete_task
 import pytz
 
@@ -22,6 +14,7 @@ line   = LineBotApi(os.environ["LINE_CHANNEL_ACCESS_TOKEN"])
 handle = WebhookHandler(os.environ["LINE_CHANNEL_SECRET"])
 MY_ID  = os.environ.get("LINE_USER_ID", "")
 AI_KEY = os.environ["ANTHROPIC_API_KEY"]
+
 _history = {}
 
 def call_ai(system, messages, max_tokens=1000):
